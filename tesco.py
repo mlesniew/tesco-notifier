@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 from datetime import datetime, date, timedelta
-import json
+import argparse
 import pickle
 import random
 import re
@@ -9,104 +9,144 @@ import time
 
 import requests
 
-USER = 'user@example.com'
-PASS = 'secret'
-NOTIFY_TOKENS = ['eins', 'zwei', 'drei']
 
-session = requests.Session()
+def login(username, password):
+    print('Logging in...')
+    session = requests.Session()
 
-print('Logging in...')
+    session.get('https://ezakupy.tesco.pl/groceries/pl-PL/')
+    resp = session.get('https://ezakupy.tesco.pl/groceries/pl-PL/login',
+                       params={'from': 'https://ezakupy.tesco.pl/groceries/pl-PL/'})
 
-session.get('https://ezakupy.tesco.pl/groceries/pl-PL/')
-resp = session.get('https://ezakupy.tesco.pl/groceries/pl-PL/login',
-                   params={'from': 'https://ezakupy.tesco.pl/groceries/pl-PL/'})
+    match = re.search('data-csrf-token="([^"]+)"', resp.text)
+    csrf_token = match.group(1)
 
-match = re.search('data-csrf-token="([^"]+)"', resp.text)
-csrf_token = match.group(1)
+    resp = session.post('https://ezakupy.tesco.pl/groceries/pl-PL/login',
+                 params={'from': 'https://ezakupy.tesco.pl/groceries/pl-PL/'},
+                 data={
+                     'email': username,
+                     'password': password,
+                     'onSuccessUrl': 'https://ezakupy.tesco.pl/groceries/pl-PL/',
+                     '_csrf': csrf_token
+                     })
+    assert resp.ok
 
-resp = session.post('https://ezakupy.tesco.pl/groceries/pl-PL/login',
-             params={'from': 'https://ezakupy.tesco.pl/groceries/pl-PL/'},
-             data={
-                 'email': USER,
-                 'password': PASS,
-                 'onSuccessUrl': 'https://ezakupy.tesco.pl/groceries/pl-PL/',
-                 '_csrf': csrf_token
-                 })
-assert resp.ok
+    print('Logged in.')
+    session.hooks = {
+            'response': lambda r, *args, **kwargs: r.raise_for_status()
+            }
+    return session
 
-print('Logged in.')
 
-try:
-    with open('tesco.dat', 'br') as f:
-        last_available = pickle.load(f)
-    print('Loaded last available:')
-    for slot in sorted(last_available):
-        print(' * %s' % slot)
-except Exception as e:
-    print('Error loading last available: %s' % e)
-    last_available = set()
+def load_last_found(filename):
+    print('Loading cache...')
+    try:
+        with open(filename, 'br') as f:
+            ret = pickle.load(f)
+        print('Loaded last available:')
+        for slot in sorted(ret):
+            print(' * %s' % slot)
+        return ret
+    except Exception as e:
+        print('Error loading last available: %s' % e)
+        return set()
 
-try:
-    while True:
-        resp = session.get('https://ezakupy.tesco.pl/groceries/pl-PL/slots/delivery')
+
+def save_last_found(filename, data):
+    print('Storing cache...')
+    with open(filename, 'wb') as f:
+        pickle.dump(data, f)
+
+
+def iter_available(session, weeks=3):
+    resp = session.get('https://ezakupy.tesco.pl/groceries/pl-PL/slots/delivery')
+    assert resp.ok
+
+    day = date.today()
+
+    for _ in range(weeks):
+        print('Checking available slots in the week of %s' % day)
+        resp = session.get('https://ezakupy.tesco.pl/groceries/pl-PL/slots/delivery/%s' % day,
+                params={'slotGroup': 2}, headers={'accept': 'application/json'})
         assert resp.ok
 
-        day = date.today()
+        slots = resp.json()['slots']
+        for slot in slots:
+            if slot.get('status') != 'UnAvailable':
+                yield slot['start']
 
-        # find last Sunday
-        #while day.weekday() != 6:
-        #    day -= timedelta(1)
+        day += timedelta(7)
 
-        available = set()
 
-        for _ in range(3):
-            print('Checking available slots in the week of %s' % day)
-            resp = session.get('https://ezakupy.tesco.pl/groceries/pl-PL/slots/delivery/%s' % day,
-                    params={'slotGroup': 2}, headers={'accept': 'application/json'})
-            assert resp.ok
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--username', '-u', required=True)
+    parser.add_argument('--password', '-p', required=True)
+    parser.add_argument('--cache', '-c', default='tesco.dat')
+    parser.add_argument('--token', '-t', action='append',
+                        help='WirePusher.com token')
+    parser.add_argument('--interval', '-i', default=0, type=int)
 
-            slots = resp.json()['slots']
-            slots = [slot for slot in slots if slot.get('status') != 'UnAvailable']
-            available |= set(slot['start'] for slot in slots)
+    args = parser.parse_args()
+    print(args)
 
-            if slots:
-                if False:
-                    with open('tesco-%s.json' % str(datetime.utcnow()), 'w', encoding='utf-8') as f:
-                        f.write(json.dumps(resp.json()))
-            day += timedelta(7)
+    last_available = load_last_found(args.cache)
+    store_cache = False
 
-        new_available = available - last_available
+    try:
+        while True:
+            session = login(args.username, args.password)
 
-        print('Slots found:', len(available))
-        for slot in sorted(available):
-            print(' * %s' % slot)
+            try:
+                while True:
+                    available = set(iter_available(session))
+                    store_cache = store_cache or (available != last_available)
 
-        print('New slots:', len(new_available))
-        for slot in sorted(new_available):
-            print(' * %s' % slot)
+                    print('%i slot(s) found.' % len(available))
+                    for slot in sorted(available):
+                        new = slot not in last_available
+                        print('* %s%s' % (slot, ' (new)' if new else ''))
 
-        if new_available:
-            if len(new_available) == 1:
-                text = 'Nowy termin dostawy w Tesco: %s' % new_available[0]
+                    new_available = available - last_available
+                    if new_available and args.token:
+                        if len(new_available) == 1:
+                            text = 'Nowy termin dostawy w Tesco: %s' % new_available[0]
+                        else:
+                            first, last = min(new_available), max(new_available)
+                            text = 'Nowe terminy dostawy w Tesco (%i), pierwszy %s, ostatni %s' % (len(new_available), first, last)
+
+                        requests.get('https://wirepusher.com/send',
+                                     params={
+                                         'id': ','.join(args.token),
+                                         'title': 'Tesco',
+                                         'message': text,
+                                         'type': 'tesco'
+                                    })
+
+                    last_available = available
+
+                    if args.interval <= 0:
+                        break
+                    else:
+                        print('Sleeping...')
+                        time.sleep(random.random() * args.interval)
+            except Exception as e:
+                print('Exception %s' % e)
+                # who cares
+
+            if args.interval <= 0:
+                break
             else:
-                first = min(new_available)
-                last = max(new_available)
-                text = 'Nowe terminy dostawy w Tesco (%i), pierwszy %s, ostatni %s' % (len(new_available), first, last)
+                print('Sleeping...')
+                time.sleep(random.random() * args.interval)
 
-            for token in NOTIFY_TOKENS:
-                requests.get('https://wirepusher.com/send',
-                             params={
-                                 'id': token,
-                                 'title': 'Tesco',
-                                 'message': text,
-                                 'type': 'tesco'
-                            })
+    finally:
+        if store_cache:
+            save_last_found(args.cache, last_available)
 
-        last_available = available
-        print('Sleeping...')
-        time.sleep(random.randint(30, 180))
-except KeyboardInterrupt:
-    raise SystemExit
-finally:
-    with open('tesco.dat', 'wb') as f:
-        pickle.dump(last_available, f)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        raise SystemExit('Abort.')
